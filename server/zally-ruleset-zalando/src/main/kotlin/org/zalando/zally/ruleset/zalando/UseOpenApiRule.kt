@@ -43,6 +43,13 @@ class UseOpenApiRule(rulesConfig: Config) {
             else -> OPENAPI3
         }
 
+        // The bundled OpenAPI 3 schema and the draft-04 validator only describe OpenAPI 3.0.
+        // OpenAPI 3.1 is based on JSON Schema 2020-12 (e.g. `$ref` may have sibling keywords),
+        // so validating a 3.1 document against it reports false violations.
+        if (version == OPENAPI3 && spec.isOpenApi31()) {
+            return emptyList()
+        }
+
         return jsonSchemaValidators[version]
             ?.validate(spec)
             .orEmpty()
@@ -50,6 +57,9 @@ class UseOpenApiRule(rulesConfig: Config) {
                 Violation("Does not match ${version.name.lowercase()} schema: ${it.description}", it.pointer)
             }
     }
+
+    private fun JsonNode.isOpenApi31(): Boolean =
+        get("openapi")?.asText()?.startsWith("3.1") == true
 
     @Check(severity = Severity.MUST)
     fun checkIfTheFormatIsYAML(context: Context): Violation? {

@@ -131,4 +131,68 @@ class UseOpenApiRuleTest {
 
         assertThat(violations).isEmpty()
     }
+
+    @Test
+    fun `validateSchema should return no violation for OpenAPI 3_1 schema property with $ref and description`() {
+        @Language("YAML")
+        val jsonNode = ObjectTreeReader().read(
+            """
+            openapi: 3.1.0
+            info:
+              title: Example API with a described reference
+              version: 1.0.0
+            paths: {}
+            components:
+              schemas:
+                Metric:
+                  type: object
+                  properties:
+                    value:
+                      type: number
+                ProductSimpleAttributes:
+                  type: object
+                  description: Contains the product attributes of a size
+                  required:
+                    - gtin
+                  properties:
+                    gtin:
+                      type: string
+                    metric.cable_length:
+                      ${'$'}ref: '#/components/schemas/Metric'
+                      description: The length of the article's cable.
+            """.trimIndent()
+        )
+
+        val violations = rule.validateSchema(jsonNode)
+
+        assertThat(violations).isEmpty()
+    }
+
+    @Test
+    fun `validateSchema should still report $ref with sibling description in OpenAPI 3_0`() {
+        @Language("YAML")
+        val jsonNode = ObjectTreeReader().read(
+            """
+            openapi: 3.0.3
+            info:
+              title: Example API with a described reference
+              version: 1.0.0
+            paths: {}
+            components:
+              schemas:
+                Metric:
+                  type: object
+                ProductSimpleAttributes:
+                  type: object
+                  properties:
+                    metric.cable_length:
+                      ${'$'}ref: '#/components/schemas/Metric'
+                      description: The length of the article's cable.
+            """.trimIndent()
+        )
+
+        val violations = rule.validateSchema(jsonNode)
+
+        assertThat(violations).isNotEmpty
+    }
 }
