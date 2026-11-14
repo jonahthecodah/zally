@@ -13,6 +13,7 @@ import org.zalando.zally.rule.api.Rule
 import org.zalando.zally.rule.api.Severity
 import org.zalando.zally.rule.api.Violation
 import org.zalando.zally.ruleset.zalando.UseOpenApiRule.OpenApiVersion.OPENAPI3
+import org.zalando.zally.ruleset.zalando.UseOpenApiRule.OpenApiVersion.OPENAPI31
 import org.zalando.zally.ruleset.zalando.UseOpenApiRule.OpenApiVersion.SWAGGER
 import java.net.URL
 
@@ -25,7 +26,7 @@ import java.net.URL
 class UseOpenApiRule(rulesConfig: Config) {
 
     private enum class OpenApiVersion {
-        SWAGGER, OPENAPI3;
+        SWAGGER, OPENAPI3, OPENAPI31;
 
         val resource: URL by lazy {
             javaClass.classLoader.getResource("schemas/${name.lowercase()}-schema.json")
@@ -40,6 +41,7 @@ class UseOpenApiRule(rulesConfig: Config) {
     fun validateSchema(spec: JsonNode): List<Violation> {
         val version = when {
             spec.get("swagger") != null -> SWAGGER
+            spec.path("openapi").asText().startsWith("3.1") -> OPENAPI31
             else -> OPENAPI3
         }
 
@@ -69,7 +71,8 @@ class UseOpenApiRule(rulesConfig: Config) {
             "http://json-schema.org/draft-04/schema" to javaClass.classLoader.getResource("schemas/json-schema.json"),
             "http://swagger.io/v2/schema.json" to SWAGGER.resource,
             "http://openapis.org/v3/schema.json" to OPENAPI3.resource,
-            "https://spec.openapis.org/oas/3.0/schema/2019-04-02" to OPENAPI3.resource
+            "https://spec.openapis.org/oas/3.0/schema/2019-04-02" to OPENAPI3.resource,
+            "https://spec.openapis.org/oas/3.1/schema/2022-10-07" to OPENAPI31.resource
         )
             .mapValues { (_, url) -> url.toString() }
 

@@ -131,4 +131,153 @@ class UseOpenApiRuleTest {
 
         assertThat(violations).isEmpty()
     }
+
+    @Test
+    fun `validateSchema should return no violation for OpenAPI 3_1 reference with description`() {
+        @Language("YAML")
+        val jsonNode = ObjectTreeReader().read(
+            """
+            openapi: 3.1.0
+            info:
+              title: Example API
+              version: 1.0.0
+            paths: {}
+            components:
+              schemas:
+                Metric:
+                  type: object
+                ProductSimpleAttributes:
+                  type: object
+                  description: Contains the product attributes of a size
+                  required:
+                    - gtin
+                  properties:
+                    gtin:
+                      type: string
+                    metric.cable_length:
+                      ${'$'}ref: '#/components/schemas/Metric'
+                      description: The length of the article's cable.
+            """.trimIndent()
+        )
+
+        val violations = rule.validateSchema(jsonNode)
+
+        assertThat(violations).isEmpty()
+    }
+
+    @Test
+    fun `validateSchema should return no violation for OpenAPI 3_1 specific features`() {
+        @Language("YAML")
+        val jsonNode = ObjectTreeReader().read(
+            """
+            openapi: 3.1.0
+            jsonSchemaDialect: https://spec.openapis.org/oas/3.1/dialect/base
+            info:
+              title: Example API
+              summary: An API using OpenAPI 3.1 features
+              version: 1.0.0
+              license:
+                name: MIT
+                identifier: MIT
+            webhooks:
+              newPet:
+                post:
+                  requestBody:
+                    description: Information about a new pet
+                    content:
+                      application/json:
+                        schema:
+                          ${'$'}ref: '#/components/schemas/Pet'
+                  responses:
+                    '200':
+                      description: Return a 200 status
+            components:
+              pathItems:
+                pets:
+                  get:
+                    summary: List pets
+              responses:
+                NotFound:
+                  ${'$'}ref: '#/components/responses/Problem'
+                  description: Resource not found
+                Problem:
+                  description: A problem occurred
+              schemas:
+                Pet:
+                  type: object
+                  required: [name]
+                  properties:
+                    name:
+                      type: [string, 'null']
+                      examples: [Rex]
+                    age:
+                      type: integer
+                      exclusiveMinimum: 0
+                    kind:
+                      const: dog
+                    tags:
+                      type: array
+                      prefixItems:
+                        - type: string
+                  additionalProperties: false
+            """.trimIndent()
+        )
+
+        val violations = rule.validateSchema(jsonNode)
+
+        assertThat(violations).isEmpty()
+    }
+
+    @Test
+    fun `validateSchema should report violations for invalid OpenAPI 3_1 specification`() {
+        @Language("YAML")
+        val jsonNode = ObjectTreeReader().read(
+            """
+            openapi: 3.1.0
+            info:
+              version: 1.0.0
+            paths:
+              /pets:
+                get:
+                  parameters:
+                    - name: limit
+                      schema:
+                        type: integer
+            """.trimIndent()
+        )
+
+        val violations = rule.validateSchema(jsonNode)
+
+        assertThat(violations).isNotEmpty
+        assertThat(violations).allMatch { it.description.startsWith("Does not match openapi31 schema") }
+        assertThat(violations).anyMatch { it.pointer.toString() == "/info" }
+    }
+
+    @Test
+    fun `validateSchema should still report OpenAPI 3_0 reference with description`() {
+        @Language("YAML")
+        val jsonNode = ObjectTreeReader().read(
+            """
+            openapi: 3.0.3
+            info:
+              title: Example API
+              version: 1.0.0
+            paths: {}
+            components:
+              schemas:
+                Metric:
+                  type: object
+                Product:
+                  type: object
+                  properties:
+                    metric:
+                      ${'$'}ref: '#/components/schemas/Metric'
+                      description: The metric.
+            """.trimIndent()
+        )
+
+        val violations = rule.validateSchema(jsonNode)
+
+        assertThat(violations).anyMatch { it.description.startsWith("Does not match openapi3 schema") }
+    }
 }
