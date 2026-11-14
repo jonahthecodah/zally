@@ -15,7 +15,7 @@ import org.springframework.http.HttpStatus
 import org.springframework.http.MediaType.APPLICATION_JSON_VALUE
 import org.springframework.http.MediaType.TEXT_HTML_VALUE
 import org.springframework.util.unit.DataSize
-import org.zalando.zally.configuration.RestTemplateConfiguration
+import org.zalando.zally.configuration.ApiDefinitionHttpClientConfiguration
 import org.zalando.zally.dto.ApiDefinitionRequest
 import org.zalando.zally.exception.InaccessibleResourceUrlException
 import org.zalando.zally.exception.MissingApiDefinitionException
@@ -184,6 +184,46 @@ class ApiDefinitionReaderTest {
         assertEquals("Received HTTP 403 while retrieving api definition url", exception.message)
     }
 
+    @Test
+    fun shouldTreatEmptyResponseAsMissingDefinition() {
+        val url = JadlerUtil.stubResource("empty.json", "")
+
+        assertThrows(MissingApiDefinitionException::class.java) { reader.read(ApiDefinitionRequest.fromUrl(url)) }
+    }
+
+    @Test
+    fun shouldNotAcceptRedirectBodyWhenRedirectsAreDisabled() {
+        val reader = reader(
+            ApiDefinitionUrlProperties().apply {
+                allowPrivateNetwork = true
+                maxRedirects = 0
+            }
+        )
+        onRequest()
+            .havingPathEqualTo("/redirect")
+            .respond()
+            .withStatus(HttpStatus.FOUND.value())
+            .withHeader("Location", JadlerUtil.stubResource("test.json", contentInJson))
+            .withHeader("Content-Type", APPLICATION_JSON_VALUE)
+            .withBody(contentInJson)
+
+        val exception = assertThrows(InaccessibleResourceUrlException::class.java) {
+            reader.read(ApiDefinitionRequest.fromUrl("http://localhost:${port()}/redirect"))
+        }
+        assertEquals(HttpStatus.BAD_GATEWAY, exception.httpStatus)
+    }
+
+    @Test
+    fun shouldNotEchoUpstreamServerErrorBody() {
+        val url = JadlerUtil.stubResource("test.json", "x".repeat(100_000), HttpStatus.INTERNAL_SERVER_ERROR.value(), APPLICATION_JSON_VALUE)
+
+        val exception = assertThrows(InaccessibleResourceUrlException::class.java) {
+            reader.read(ApiDefinitionRequest.fromUrl(url))
+        }
+        assertEquals(HttpStatus.BAD_GATEWAY, exception.httpStatus)
+        assertEquals("Received HTTP 500 while retrieving api definition url", exception.message)
+    }
+
     private fun stubRedirect(path: String, location: String) {
         onRequest()
             .havingPathEqualTo(path)
@@ -199,7 +239,7 @@ class ApiDefinitionReaderTest {
 
     private fun reader(properties: ApiDefinitionUrlProperties): ApiDefinitionReader {
         val policy = ApiDefinitionUrlPolicy(properties)
-        return ApiDefinitionReader(RestTemplateConfiguration().restTemplate(policy, properties), policy, properties)
+        return ApiDefinitionReader(ApiDefinitionHttpClientConfiguration().apiDefinitionHttpClient(policy, properties), policy, properties)
     }
 
     companion object {

@@ -1,33 +1,36 @@
 package org.zalando.zally.apireview
 
+import org.apache.http.HttpHeaders.ACCEPT
+import org.apache.http.HttpResponse
+import org.apache.http.client.methods.HttpGet
+import org.apache.http.impl.client.CloseableHttpClient
 import org.springframework.http.HttpHeaders
 import org.springframework.http.HttpInputMessage
-import org.springframework.http.HttpMethod
 import org.springframework.http.HttpStatus
 import org.springframework.http.HttpStatus.BAD_GATEWAY
 import org.springframework.http.HttpStatus.BAD_REQUEST
 import org.springframework.http.HttpStatus.NOT_FOUND
 import org.springframework.http.HttpStatus.PAYLOAD_TOO_LARGE
 import org.springframework.http.HttpStatus.UNSUPPORTED_MEDIA_TYPE
+import org.springframework.http.InvalidMediaTypeException
+import org.springframework.http.MediaType
 import org.springframework.http.MediaType.parseMediaTypes
-import org.springframework.http.client.ClientHttpResponse
 import org.springframework.http.converter.StringHttpMessageConverter
 import org.springframework.stereotype.Component
-import org.springframework.web.client.ResourceAccessException
-import org.springframework.web.client.RestClientResponseException
-import org.springframework.web.client.RestTemplate
+import org.springframework.web.util.DefaultUriBuilderFactory
 import org.zalando.zally.dto.ApiDefinitionRequest
 import org.zalando.zally.exception.InaccessibleResourceUrlException
 import org.zalando.zally.exception.MissingApiDefinitionException
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.io.InputStream
 import java.net.URI
 import java.net.UnknownHostException
 
 @Component
 class ApiDefinitionReader(
-    private val client: RestTemplate,
+    private val client: CloseableHttpClient,
     private val urlPolicy: ApiDefinitionUrlPolicy,
     private val properties: ApiDefinitionUrlProperties
 ) {
@@ -42,49 +45,55 @@ class ApiDefinitionReader(
         val uri = parseUri(removeSpecialCharactersSuffix(url))
         return try {
             urlPolicy.checkUrl(uri)
-            client.execute(uri, HttpMethod.GET, { it.headers.accept = MEDIA_TYPE_WHITELIST }, ::extractBody)
+            val request = HttpGet(uri).apply { setHeader(ACCEPT, MediaType.toString(MEDIA_TYPE_WHITELIST)) }
+            client.execute(request).use { response ->
+                try {
+                    extractBody(response)
+                } catch (exception: Exception) {
+                    // abort instead of draining the rest of a rejected response
+                    request.abort()
+                    throw exception
+                }
+            }
         } catch (exception: ForbiddenApiDefinitionUrlException) {
             throw forbidden(exception)
         } catch (exception: UnknownHostException) {
-            throw unknownHost(uri)
-        } catch (exception: RestClientResponseException) {
-            val status = HttpStatus.resolve(exception.rawStatusCode)?.takeIf { it.is4xxClientError } ?: BAD_GATEWAY
-            throw InaccessibleResourceUrlException(
-                "Received HTTP ${exception.rawStatusCode} while retrieving api definition url",
-                status
-            )
-        } catch (exception: ResourceAccessException) {
-            throw when (val cause = exception.cause) {
-                is ForbiddenApiDefinitionUrlException -> forbidden(cause)
-                is UnknownHostException -> unknownHost(uri)
-                else -> InaccessibleResourceUrlException(
-                    "Unable to connect while retrieving api definition url",
-                    NOT_FOUND
-                )
-            }
+            throw InaccessibleResourceUrlException("Unknown host while retrieving api definition url: ${uri.host}", NOT_FOUND)
+        } catch (exception: IOException) {
+            throw InaccessibleResourceUrlException("Unable to connect while retrieving api definition url", NOT_FOUND)
         }
     }
 
     private fun parseUri(url: String): URI = try {
-        client.uriTemplateHandler.expand(url)
+        URI_FACTORY.expand(url)
     } catch (exception: IllegalArgumentException) {
         throw InaccessibleResourceUrlException("Invalid api definition url", BAD_REQUEST)
     }
 
-    private fun extractBody(response: ClientHttpResponse): String? {
-        val contentType = response.headers.contentType
-        if (contentType != null && MEDIA_TYPE_WHITELIST.none { contentType.isCompatibleWith(it) }) {
-            throw InaccessibleResourceUrlException(
-                "Unexpected content type while retrieving api definition url: $contentType",
-                UNSUPPORTED_MEDIA_TYPE
-            )
+    private fun extractBody(response: HttpResponse): String? {
+        val statusCode = response.statusLine.statusCode
+        if (statusCode !in 200..299) {
+            val status = HttpStatus.resolve(statusCode)?.takeIf { it.is4xxClientError } ?: BAD_GATEWAY
+            throw InaccessibleResourceUrlException("Received HTTP $statusCode while retrieving api definition url", status)
         }
 
-        val body = response.body.use(::readLimited)
+        val headers = HttpHeaders()
+        response.allHeaders.forEach { headers.add(it.name, it.value) }
+        val contentType = try {
+            headers.contentType
+        } catch (exception: InvalidMediaTypeException) {
+            throw unsupportedContentType(headers.getFirst(HttpHeaders.CONTENT_TYPE))
+        }
+        if (contentType != null && MEDIA_TYPE_WHITELIST.none { contentType.isCompatibleWith(it) }) {
+            throw unsupportedContentType(contentType.toString())
+        }
+
+        val body = response.entity?.content?.let(::readLimited)
+        if (body == null || body.isEmpty()) return null
         return StringHttpMessageConverter().read(
             String::class.java,
             object : HttpInputMessage {
-                override fun getHeaders(): HttpHeaders = response.headers
+                override fun getHeaders(): HttpHeaders = headers
                 override fun getBody(): InputStream = ByteArrayInputStream(body)
             }
         )
@@ -108,11 +117,13 @@ class ApiDefinitionReader(
         return output.toByteArray()
     }
 
+    private fun unsupportedContentType(contentType: String?) = InaccessibleResourceUrlException(
+        "Unexpected content type while retrieving api definition url: $contentType",
+        UNSUPPORTED_MEDIA_TYPE
+    )
+
     private fun forbidden(exception: ForbiddenApiDefinitionUrlException) =
         InaccessibleResourceUrlException("Api definition url is not allowed: ${exception.message}", BAD_REQUEST)
-
-    private fun unknownHost(uri: URI) =
-        InaccessibleResourceUrlException("Unknown host while retrieving api definition url: ${uri.host}", NOT_FOUND)
 
     private fun removeSpecialCharactersSuffix(url: String): String = when {
         url.endsWith(SPECIAL_CHARACTERS_SUFFIX) -> url.substring(0, url.length - SPECIAL_CHARACTERS_SUFFIX.length)
@@ -123,6 +134,10 @@ class ApiDefinitionReader(
 
         // some internal systems add these characters at the end of some urls, don't know why
         private const val SPECIAL_CHARACTERS_SUFFIX = "%3D%3D"
+
+        private val URI_FACTORY = DefaultUriBuilderFactory().apply {
+            encodingMode = DefaultUriBuilderFactory.EncodingMode.URI_COMPONENT
+        }
 
         // a whitelist of mime-types to accept when expecting JSON or YAML
         private val MEDIA_TYPE_WHITELIST = parseMediaTypes(
