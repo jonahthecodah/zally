@@ -22,6 +22,7 @@ dependencies {
     implementation(project(":zally-ruleset-zally"))
     implementation("org.springframework.boot:spring-boot-starter-web")
     implementation("org.springframework.boot:spring-boot-starter-undertow")
+    implementation("org.apache.httpcomponents:httpclient")
     implementation("org.springframework.boot:spring-boot-starter-actuator")
     implementation("org.springframework.boot:spring-boot-starter-data-jpa") {
         exclude("org.hibernate", "hibernate-entitymanager")

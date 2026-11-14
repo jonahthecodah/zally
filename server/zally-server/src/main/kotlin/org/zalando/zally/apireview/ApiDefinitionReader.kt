@@ -1,21 +1,36 @@
 package org.zalando.zally.apireview
 
-import org.springframework.http.HttpEntity
 import org.springframework.http.HttpHeaders
+import org.springframework.http.HttpInputMessage
 import org.springframework.http.HttpMethod
 import org.springframework.http.HttpStatus
+import org.springframework.http.HttpStatus.BAD_GATEWAY
+import org.springframework.http.HttpStatus.BAD_REQUEST
+import org.springframework.http.HttpStatus.NOT_FOUND
+import org.springframework.http.HttpStatus.PAYLOAD_TOO_LARGE
 import org.springframework.http.HttpStatus.UNSUPPORTED_MEDIA_TYPE
 import org.springframework.http.MediaType.parseMediaTypes
+import org.springframework.http.client.ClientHttpResponse
+import org.springframework.http.converter.StringHttpMessageConverter
 import org.springframework.stereotype.Component
-import org.springframework.web.client.HttpClientErrorException
 import org.springframework.web.client.ResourceAccessException
+import org.springframework.web.client.RestClientResponseException
 import org.springframework.web.client.RestTemplate
 import org.zalando.zally.dto.ApiDefinitionRequest
 import org.zalando.zally.exception.InaccessibleResourceUrlException
 import org.zalando.zally.exception.MissingApiDefinitionException
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.net.URI
+import java.net.UnknownHostException
 
 @Component
-class ApiDefinitionReader(private val client: RestTemplate) {
+class ApiDefinitionReader(
+    private val client: RestTemplate,
+    private val urlPolicy: ApiDefinitionUrlPolicy,
+    private val properties: ApiDefinitionUrlProperties
+) {
 
     fun read(request: ApiDefinitionRequest): String =
         request.apiDefinitionString?.let { it }
@@ -23,14 +38,40 @@ class ApiDefinitionReader(private val client: RestTemplate) {
             ?: request.apiDefinitionUrl?.let { readFromUrl(it) }
             ?: throw MissingApiDefinitionException()
 
-    private fun readFromUrl(url: String): String? = try {
-        val headers = HttpHeaders()
-        headers.accept = MEDIA_TYPE_WHITELIST
+    private fun readFromUrl(url: String): String? {
+        val uri = parseUri(removeSpecialCharactersSuffix(url))
+        return try {
+            urlPolicy.checkUrl(uri)
+            client.execute(uri, HttpMethod.GET, { it.headers.accept = MEDIA_TYPE_WHITELIST }, ::extractBody)
+        } catch (exception: ForbiddenApiDefinitionUrlException) {
+            throw forbidden(exception)
+        } catch (exception: UnknownHostException) {
+            throw unknownHost(uri)
+        } catch (exception: RestClientResponseException) {
+            val status = HttpStatus.resolve(exception.rawStatusCode)?.takeIf { it.is4xxClientError } ?: BAD_GATEWAY
+            throw InaccessibleResourceUrlException(
+                "Received HTTP ${exception.rawStatusCode} while retrieving api definition url",
+                status
+            )
+        } catch (exception: ResourceAccessException) {
+            throw when (val cause = exception.cause) {
+                is ForbiddenApiDefinitionUrlException -> forbidden(cause)
+                is UnknownHostException -> unknownHost(uri)
+                else -> InaccessibleResourceUrlException(
+                    "Unable to connect while retrieving api definition url",
+                    NOT_FOUND
+                )
+            }
+        }
+    }
 
-        val entity = HttpEntity<String>(null, headers)
+    private fun parseUri(url: String): URI = try {
+        client.uriTemplateHandler.expand(url)
+    } catch (exception: IllegalArgumentException) {
+        throw InaccessibleResourceUrlException("Invalid api definition url", BAD_REQUEST)
+    }
 
-        val response = client.exchange(removeSpecialCharactersSuffix(url), HttpMethod.GET, entity, String::class.java)
-
+    private fun extractBody(response: ClientHttpResponse): String? {
         val contentType = response.headers.contentType
         if (contentType != null && MEDIA_TYPE_WHITELIST.none { contentType.isCompatibleWith(it) }) {
             throw InaccessibleResourceUrlException(
@@ -39,18 +80,39 @@ class ApiDefinitionReader(private val client: RestTemplate) {
             )
         }
 
-        response.body
-    } catch (exception: HttpClientErrorException) {
-        throw InaccessibleResourceUrlException(
-            "${exception.message} while retrieving api definition url",
-            exception.statusCode
-        )
-    } catch (exception: ResourceAccessException) {
-        throw InaccessibleResourceUrlException(
-            "Unknown host while retrieving api definition url: ${exception.cause?.message}",
-            HttpStatus.NOT_FOUND
+        val body = response.body.use(::readLimited)
+        return StringHttpMessageConverter().read(
+            String::class.java,
+            object : HttpInputMessage {
+                override fun getHeaders(): HttpHeaders = response.headers
+                override fun getBody(): InputStream = ByteArrayInputStream(body)
+            }
         )
     }
+
+    private fun readLimited(input: InputStream): ByteArray {
+        val limit = properties.maxResponseSize.toBytes()
+        val output = ByteArrayOutputStream()
+        val buffer = ByteArray(8192)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            if (output.size() + read > limit) {
+                throw InaccessibleResourceUrlException(
+                    "Api definition retrieved from url exceeds the maximum size of $limit bytes",
+                    PAYLOAD_TOO_LARGE
+                )
+            }
+            output.write(buffer, 0, read)
+        }
+        return output.toByteArray()
+    }
+
+    private fun forbidden(exception: ForbiddenApiDefinitionUrlException) =
+        InaccessibleResourceUrlException("Api definition url is not allowed: ${exception.message}", BAD_REQUEST)
+
+    private fun unknownHost(uri: URI) =
+        InaccessibleResourceUrlException("Unknown host while retrieving api definition url: ${uri.host}", NOT_FOUND)
 
     private fun removeSpecialCharactersSuffix(url: String): String = when {
         url.endsWith(SPECIAL_CHARACTERS_SUFFIX) -> url.substring(0, url.length - SPECIAL_CHARACTERS_SUFFIX.length)

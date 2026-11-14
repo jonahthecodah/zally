@@ -22,7 +22,8 @@ import java.time.LocalDate
 
 @SpringBootTest(
     webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-    classes = [Application::class, RestApiTestConfiguration::class]
+    classes = [Application::class, RestApiTestConfiguration::class],
+    properties = ["zally.api-definition-url.allow-private-network=true"]
 )
 @ActiveProfiles("test", "limited-rules")
 abstract class RestApiBaseTest {

@@ -2,6 +2,9 @@ package org.zalando.zally.apireview
 
 import net.jadler.Jadler.closeJadler
 import net.jadler.Jadler.initJadlerUsing
+import net.jadler.Jadler.onRequest
+import net.jadler.Jadler.port
+import net.jadler.Jadler.verifyThatRequest
 import net.jadler.stubbing.server.jdk.JdkStubHttpServer
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -11,7 +14,8 @@ import org.junit.jupiter.api.Test
 import org.springframework.http.HttpStatus
 import org.springframework.http.MediaType.APPLICATION_JSON_VALUE
 import org.springframework.http.MediaType.TEXT_HTML_VALUE
-import org.springframework.web.client.RestTemplate
+import org.springframework.util.unit.DataSize
+import org.zalando.zally.configuration.RestTemplateConfiguration
 import org.zalando.zally.dto.ApiDefinitionRequest
 import org.zalando.zally.exception.InaccessibleResourceUrlException
 import org.zalando.zally.exception.MissingApiDefinitionException
@@ -26,7 +30,7 @@ class ApiDefinitionReaderTest {
     @BeforeEach
     fun setUp() {
         initJadlerUsing(JdkStubHttpServer())
-        reader = ApiDefinitionReader(RestTemplate())
+        reader = reader(ApiDefinitionUrlProperties().apply { allowPrivateNetwork = true })
     }
 
     @AfterEach
@@ -89,6 +93,113 @@ class ApiDefinitionReaderTest {
         val url = JadlerUtil.stubResource("test.json", "", HttpStatus.OK.value(), TEXT_HTML_VALUE)
 
         assertThrows(InaccessibleResourceUrlException::class.java, { reader.read(ApiDefinitionRequest.fromUrl(url)) })
+    }
+
+    @Test
+    fun shouldRejectLoopbackUrlBeforeConnecting() {
+        val url = "http://127.0.0.1:${port()}/health"
+        onRequest().respond().withStatus(HttpStatus.OK.value()).withBody(contentInJson)
+
+        assertForbidden(reader(ApiDefinitionUrlProperties()), url)
+        assertForbidden(reader(ApiDefinitionUrlProperties()), "http://127.0.0.1:7979/health")
+        verifyThatRequest().receivedNever()
+    }
+
+    @Test
+    fun shouldRejectNonPublicAddresses() {
+        val reader = reader(ApiDefinitionUrlProperties())
+        listOf(
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/zally-role",
+            "http://localhost:7979/health",
+            "http://0.0.0.0/",
+            "http://10.0.0.1/",
+            "http://192.168.1.1/",
+            "http://[::1]/",
+            "http://[::ffff:169.254.169.254]/",
+            "http://[fd00::1]/",
+            "http://2852039166/"
+        ).forEach { assertForbidden(reader, it) }
+    }
+
+    @Test
+    fun shouldRejectNonHttpSchemes() {
+        listOf("file:///etc/passwd", "ftp://zalando.de/api.yaml", "jar:file:/tmp/x.jar!/api.yaml")
+            .forEach { assertForbidden(reader, it) }
+    }
+
+    @Test
+    fun shouldRejectHostsOutsideAllowList() {
+        val reader = reader(ApiDefinitionUrlProperties().apply { allowedHosts = listOf("*.github.com") })
+        assertForbidden(reader, "http://example.com/api.yaml")
+        assertForbidden(reader, "http://notgithub.com/api.yaml")
+    }
+
+    @Test
+    fun shouldFollowRedirectsToAllowedHosts() {
+        val url = JadlerUtil.stubResource("test.json", contentInJson)
+        stubRedirect("/redirect", url)
+
+        val result = reader.read(ApiDefinitionRequest.fromUrl("http://localhost:${port()}/redirect"))
+
+        assertEquals(contentInJson, result)
+    }
+
+    @Test
+    fun shouldRejectRedirectToInternalAddress() {
+        val reader = reader(
+            ApiDefinitionUrlProperties().apply {
+                allowPrivateNetwork = true
+                allowedHosts = listOf("localhost")
+            }
+        )
+        stubRedirect("/redirect", "http://169.254.169.254/latest/meta-data/")
+
+        assertForbidden(reader, "http://localhost:${port()}/redirect")
+    }
+
+    @Test
+    fun shouldRejectResponsesExceedingMaximumSize() {
+        val reader = reader(
+            ApiDefinitionUrlProperties().apply {
+                allowPrivateNetwork = true
+                maxResponseSize = DataSize.ofBytes(8)
+            }
+        )
+        val url = JadlerUtil.stubResource("test.json", contentInJson)
+
+        val exception = assertThrows(InaccessibleResourceUrlException::class.java) {
+            reader.read(ApiDefinitionRequest.fromUrl(url))
+        }
+        assertEquals(HttpStatus.PAYLOAD_TOO_LARGE, exception.httpStatus)
+    }
+
+    @Test
+    fun shouldNotEchoUpstreamErrorBody() {
+        val url = JadlerUtil.stubResource("test.json", "secret", HttpStatus.FORBIDDEN.value(), APPLICATION_JSON_VALUE)
+
+        val exception = assertThrows(InaccessibleResourceUrlException::class.java) {
+            reader.read(ApiDefinitionRequest.fromUrl(url))
+        }
+        assertEquals(HttpStatus.FORBIDDEN, exception.httpStatus)
+        assertEquals("Received HTTP 403 while retrieving api definition url", exception.message)
+    }
+
+    private fun stubRedirect(path: String, location: String) {
+        onRequest()
+            .havingPathEqualTo(path)
+            .respond()
+            .withStatus(HttpStatus.FOUND.value())
+            .withHeader("Location", location)
+    }
+
+    private fun assertForbidden(reader: ApiDefinitionReader, url: String) {
+        val exception = assertThrows(InaccessibleResourceUrlException::class.java, { reader.read(ApiDefinitionRequest.fromUrl(url)) }, url)
+        assertEquals(HttpStatus.BAD_REQUEST, exception.httpStatus, url)
+    }
+
+    private fun reader(properties: ApiDefinitionUrlProperties): ApiDefinitionReader {
+        val policy = ApiDefinitionUrlPolicy(properties)
+        return ApiDefinitionReader(RestTemplateConfiguration().restTemplate(policy, properties), policy, properties)
     }
 
     companion object {
